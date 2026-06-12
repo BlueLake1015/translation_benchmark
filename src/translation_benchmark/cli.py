@@ -5,6 +5,7 @@ from pathlib import Path
 
 import click
 
+from translation_benchmark import guards
 from translation_benchmark.benchmark.runner import (
     results_to_json,
     results_to_markdown,
@@ -39,22 +40,73 @@ def list_models(tier: int | None, include_test: bool) -> None:
             if spec.supports_context and spec.approx_context_tokens
             else ("context" if spec.supports_context else "SENTENCE-LEVEL ONLY")
         )
+        engines = spec.supported_engines()
+        engine_label = ", ".join([f"{engines[0]} (default)"] + list(engines[1:]))
         click.echo(f"  {spec.key:<22} {spec.display_name:<22} {context:<28} {spec.vram_note}")
+        click.echo(f"  {'':<22} engines: {engine_label}")
+        click.echo(f"  {'':<22} quant: {', '.join(spec.quant_variants())}")
         click.echo(f"  {'':<22} {spec.notes}")
 
 
-def _common_model_kwargs(hf_id: str | None, load_in_4bit: bool, use_ct2: bool, ct2_dir: str | None):
+def _common_model_kwargs(
+    hf_id: str | None,
+    quant: str | None,
+    ct2_dir: str | None,
+    models_dir: str | None = None,
+    prompt_style: str | None = None,
+):
     kwargs: dict = {}
     if hf_id:
         kwargs["hf_id"] = hf_id
-    if load_in_4bit:
-        kwargs["load_in_4bit"] = True
-    if use_ct2:
-        kwargs["use_ct2"] = True
+    if models_dir:
+        kwargs["models_dir"] = models_dir
+    if quant:
+        kwargs["quant"] = quant
     if ct2_dir:
-        kwargs["use_ct2"] = True
         kwargs["ct2_dir"] = ct2_dir
+    if prompt_style:
+        kwargs["prompt_style"] = prompt_style
     return kwargs
+
+
+PROMPT_STYLE_OPTION = click.option(
+    "--prompt-style",
+    type=click.Choice(["translategemma", "qwen", "tower"]),
+    default=None,
+    help="Override the prompt format for A/B testing [default: the model "
+    "family's tuned prompt from the registry].",
+)
+
+
+MODELS_DIR_OPTION = click.option(
+    "--models-dir",
+    default="models",
+    show_default=True,
+    envvar="TB_MODELS_DIR",
+    help="Local directory model weights are loaded from / downloaded into.",
+)
+
+QUANT_OPTION = click.option(
+    "--quant",
+    default=None,
+    help="Quantization variant: 4bit/8bit (on-the-fly bitsandbytes) or a "
+    "model-specific pre-quantized repo (e.g. awq, fp8 — see tb list-models).",
+)
+
+NO_GUARD_OPTION = click.option(
+    "--no-guard",
+    is_flag=True,
+    help="Disable hallucination detection/mitigation (cleaning, "
+    "retry-without-context, context quarantine).",
+)
+
+ENGINE_OPTION = click.option(
+    "--engine",
+    type=click.Choice(["transformers", "vllm", "ct2"]),
+    default=None,
+    help="Serving stack [default: the model's optimized engine — vllm for "
+    "chat models, ct2 for Tier 4; transformers is the fallback].",
+)
 
 
 @main.command()
@@ -68,7 +120,11 @@ def _common_model_kwargs(hf_id: str | None, load_in_4bit: bool, use_ct2: bool, c
               help="Previous subtitle pairs fed as context (context-aware models only).")
 @click.option("--device", default="auto", show_default=True)
 @click.option("--hf-id", default=None, help="Override the Hugging Face repo id.")
-@click.option("--load-in-4bit", is_flag=True, help="4-bit quantization (chat models).")
+@MODELS_DIR_OPTION
+@QUANT_OPTION
+@ENGINE_OPTION
+@PROMPT_STYLE_OPTION
+@NO_GUARD_OPTION
 @click.option("--ct2-dir", default=None, help="CTranslate2 model dir (NLLB only).")
 def translate(
     input_srt: str,
@@ -79,12 +135,19 @@ def translate(
     context_window: int,
     device: str,
     hf_id: str | None,
-    load_in_4bit: bool,
+    models_dir: str,
+    quant: str | None,
+    engine: str | None,
+    prompt_style: str | None,
+    no_guard: bool,
     ct2_dir: str | None,
 ) -> None:
     """Translate a subtitle file, preserving timings."""
     translator = create_translator(
-        model, device=device, **_common_model_kwargs(hf_id, load_in_4bit, False, ct2_dir)
+        model,
+        device=device,
+        engine=engine,
+        **_common_model_kwargs(hf_id, quant, ct2_dir, models_dir, prompt_style),
     )
     lines = load_srt(input_srt)
     texts = [prepare_for_translation(line.text) for line in lines]
@@ -94,11 +157,24 @@ def translate(
             err=True,
         )
     translations = translator.translate_document(
-        texts, src, tgt, max_context_pairs=context_window
+        texts, src, tgt, max_context_pairs=context_window, guard=not no_guard
     )
     out_path = output or str(Path(input_srt).with_suffix(f".{tgt}.srt"))
     save_srt(out_path, translated_copy(lines, translations))
     click.echo(f"Wrote {len(translations)} cues to {out_path}")
+    if not no_guard:
+        per_line = getattr(translator, "last_issues", [])
+        flagged = [(i, issues) for i, issues in enumerate(per_line) if issues]
+        if flagged:
+            counts = ", ".join(
+                f"{code}: {n}" for code, n in sorted(guards.summarize(per_line).items())
+            )
+            click.echo(
+                f"warning: guard flagged {len(flagged)}/{len(per_line)} lines "
+                f"({counts}) — review cues "
+                + ", ".join(str(lines[i].index) for i, _ in flagged[:10]),
+                err=True,
+            )
 
 
 @main.command()
@@ -114,7 +190,11 @@ def translate(
 @click.option("--context-window", default=8, show_default=True)
 @click.option("--device", default="auto", show_default=True)
 @click.option("--hf-id", default=None, help="Override repo id (single-model runs).")
-@click.option("--load-in-4bit", is_flag=True)
+@MODELS_DIR_OPTION
+@QUANT_OPTION
+@ENGINE_OPTION
+@PROMPT_STYLE_OPTION
+@NO_GUARD_OPTION
 @click.option("--ct2-dir", default=None, help="CTranslate2 model dir (NLLB only).")
 def benchmark(
     input_srt: str,
@@ -126,7 +206,11 @@ def benchmark(
     context_window: int,
     device: str,
     hf_id: str | None,
-    load_in_4bit: bool,
+    models_dir: str,
+    quant: str | None,
+    engine: str | None,
+    prompt_style: str | None,
+    no_guard: bool,
     ct2_dir: str | None,
 ) -> None:
     """Benchmark one or more models on a subtitle file."""
@@ -145,7 +229,10 @@ def benchmark(
     for key in models:
         click.echo(f"Benchmarking {key} ...")
         translator = create_translator(
-            key, device=device, **_common_model_kwargs(hf_id, load_in_4bit, False, ct2_dir)
+            key,
+            device=device,
+            engine=engine,
+            **_common_model_kwargs(hf_id, quant, ct2_dir, models_dir, prompt_style),
         )
         result = run_benchmark(
             translator,
@@ -154,6 +241,7 @@ def benchmark(
             tgt,
             reference_texts=reference_texts,
             max_context_pairs=context_window,
+            guard=not no_guard,
         )
         if result.error:
             click.echo(f"  ERROR:\n{result.error}", err=True)

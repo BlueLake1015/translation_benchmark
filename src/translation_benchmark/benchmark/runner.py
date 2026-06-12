@@ -7,6 +7,7 @@ import time
 import traceback
 from dataclasses import asdict, dataclass
 
+from translation_benchmark import guards
 from translation_benchmark.benchmark import metrics
 from translation_benchmark.models.base import BaseTranslator
 from translation_benchmark.subtitles import SubtitleLine, prepare_for_translation
@@ -27,6 +28,9 @@ class BenchmarkResult:
     bleu: float | None
     error: str | None = None
     translations: list[str] | None = None
+    # Hallucination guard findings (None when guards are disabled or on error)
+    flagged_segments: int | None = None
+    issue_counts: dict[str, int] | None = None
 
 
 def run_benchmark(
@@ -37,6 +41,7 @@ def run_benchmark(
     reference_texts: list[str] | None = None,
     max_context_pairs: int = 8,
     keep_translations: bool = True,
+    guard: bool = True,
 ) -> BenchmarkResult:
     """Benchmark one model on one subtitle document.
 
@@ -60,7 +65,7 @@ def run_benchmark(
         translator.load()
         start = time.perf_counter()
         translations = translator.translate_document(
-            texts, src_lang, tgt_lang, max_context_pairs=max_context_pairs
+            texts, src_lang, tgt_lang, max_context_pairs=max_context_pairs, guard=guard
         )
         wall = time.perf_counter() - start
     except Exception:
@@ -80,6 +85,12 @@ def run_benchmark(
         chrf_score = metrics.chrf(translations, refs)
         bleu_score = metrics.bleu(translations, refs, tgt_lang=tgt_lang)
 
+    flagged = issue_counts = None
+    if guard:
+        per_line = getattr(translator, "last_issues", [])
+        flagged = sum(1 for issues in per_line if issues)
+        issue_counts = guards.summarize(per_line)
+
     return BenchmarkResult(
         **base,
         wall_seconds=wall,
@@ -88,6 +99,8 @@ def run_benchmark(
         chrf=chrf_score,
         bleu=bleu_score,
         translations=translations if keep_translations else None,
+        flagged_segments=flagged,
+        issue_counts=issue_counts,
     )
 
 
@@ -101,16 +114,17 @@ def results_to_markdown(results: list[BenchmarkResult]) -> str:
         results, key=lambda r: (r.error is not None, -(r.chrf if r.chrf is not None else -1))
     )
     out = [
-        "| Model | Tier | Context | Segments | Time (s) | Seg/s | chrF++ | BLEU | Status |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| Model | Tier | Context | Segments | Time (s) | Seg/s | chrF++ | BLEU | Flagged | Status |",
+        "|---|---|---|---|---|---|---|---|---|---|",
     ]
     for r in rows:
         fmt = lambda value: f"{value:.2f}" if value is not None else "-"
         status = "ERROR" if r.error else "ok"
         context = "yes" if r.supports_context else "sentence-level"
+        flagged = "-" if r.flagged_segments is None else str(r.flagged_segments)
         out.append(
             f"| {r.display_name} | {r.tier} | {context} | {r.num_segments} "
             f"| {fmt(r.wall_seconds)} | {fmt(r.segments_per_second)} "
-            f"| {fmt(r.chrf)} | {fmt(r.bleu)} | {status} |"
+            f"| {fmt(r.chrf)} | {fmt(r.bleu)} | {flagged} | {status} |"
         )
     return "\n".join(out)

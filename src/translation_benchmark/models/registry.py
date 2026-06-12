@@ -29,6 +29,7 @@ MODELS: dict[str, ModelSpec] = {
             params_b=27,
             backend="chat",
             prompt_style="translategemma",
+            engines=("vllm", "transformers"),
             supports_context=True,
             approx_context_tokens=128_000,
             vram_note="~16 GB at 4-bit",
@@ -44,11 +45,18 @@ MODELS: dict[str, ModelSpec] = {
             params_b=32,
             backend="chat",
             prompt_style="qwen",
+            engines=("vllm", "transformers"),
             supports_context=True,
             approx_context_tokens=32_768,
             vram_note="~20 GB at 4-bit",
             notes="Best general-purpose option at this size; strongest indirect "
             "hallucination evidence in the field.",
+            quant_repos=(
+                ("awq", "Qwen/Qwen3-32B-AWQ"),
+                ("fp8", "Qwen/Qwen3-32B-FP8"),
+            ),
+            # bf16 base is 65.5 GB; AWQ/FP8 cover usage. --quant full opts in.
+            download_full_by_default=False,
         ),
         ModelSpec(
             key="translategemma-12b",
@@ -59,6 +67,7 @@ MODELS: dict[str, ModelSpec] = {
             params_b=12,
             backend="chat",
             prompt_style="translategemma",
+            engines=("vllm", "transformers"),
             supports_context=True,
             approx_context_tokens=128_000,
             vram_note="~8 GB at 4-bit",
@@ -73,6 +82,7 @@ MODELS: dict[str, ModelSpec] = {
             params_b=9,
             backend="chat",
             prompt_style="tower",
+            engines=("vllm", "transformers"),
             supports_context=True,
             approx_context_tokens=8_192,
             vram_note="~6 GB at 4-bit",
@@ -88,10 +98,17 @@ MODELS: dict[str, ModelSpec] = {
             params_b=14,
             backend="chat",
             prompt_style="qwen",
+            engines=("vllm", "transformers"),
             supports_context=True,
             approx_context_tokens=32_768,
             vram_note="~10 GB at 4-bit",
             notes="Slightly below the three above; excellent quality-per-GB.",
+            quant_repos=(
+                ("awq", "Qwen/Qwen3-14B-AWQ"),
+                ("fp8", "Qwen/Qwen3-14B-FP8"),
+            ),
+            # bf16 base is 29.6 GB; AWQ/FP8 cover usage. --quant full opts in.
+            download_full_by_default=False,
         ),
         # ----- Tier 3 -------------------------------------------------------
         ModelSpec(
@@ -103,6 +120,7 @@ MODELS: dict[str, ModelSpec] = {
             params_b=4,
             backend="chat",
             prompt_style="translategemma",
+            engines=("vllm", "transformers"),
             supports_context=True,
             approx_context_tokens=128_000,
             vram_note="~3 GB quantized",
@@ -117,6 +135,7 @@ MODELS: dict[str, ModelSpec] = {
             params_b=7,
             backend="chat",
             prompt_style="tower",
+            engines=("vllm", "transformers"),
             supports_context=True,
             approx_context_tokens=4_096,
             vram_note="~5 GB at 4-bit",
@@ -133,6 +152,7 @@ MODELS: dict[str, ModelSpec] = {
             params_b=10,
             backend="seq2seq-madlad",
             prompt_style="",
+            engines=("ct2", "transformers"),
             supports_context=False,
             approx_context_tokens=None,
             vram_note="~7 GB at int8",
@@ -148,6 +168,7 @@ MODELS: dict[str, ModelSpec] = {
             params_b=3.3,
             backend="seq2seq-nllb",
             prompt_style="",
+            engines=("ct2", "transformers"),
             supports_context=False,
             approx_context_tokens=None,
             vram_note="CPU-viable via CTranslate2 (int8)",
@@ -191,23 +212,54 @@ def list_specs(tier: int | None = None, include_test: bool = False) -> list[Mode
     return sorted(specs, key=lambda spec: (spec.tier, -spec.params_b))
 
 
-def create_translator(key: str, device: str = "auto", **kwargs) -> BaseTranslator:
+ENGINES = ("transformers", "vllm", "ct2")
+
+
+def create_translator(
+    key: str, device: str = "auto", engine: str | None = None, **kwargs
+) -> BaseTranslator:
     """Instantiate the right backend for a model key.
 
-    kwargs are forwarded to the backend (e.g. hf_id=, load_in_4bit=, ct2_dir=).
-    Pass use_ct2=True with nllb200-3.3b to use the CTranslate2 backend.
+    engine selects the serving stack; by default each model uses its
+    OPTIMIZED engine: vLLM for chat models (Tiers 1-3), CTranslate2 for the
+    Tier 4 encoder-decoder models. Pass engine="transformers" for the
+    plain-transformers fallback.
+
+    kwargs are forwarded to the backend (e.g. hf_id=, quant=, models_dir=,
+    ct2_dir=). quant accepts "4bit"/"8bit" (on-the-fly bitsandbytes) or a
+    model-specific pre-quantized variant (see ModelSpec.quant_variants()).
     """
+    if kwargs.pop("use_ct2", False):  # backward-compatible alias
+        engine = "ct2"
     spec = get_spec(key)
+    if engine is None:
+        engine = spec.default_engine()
+    if engine not in ENGINES:
+        raise ValueError(f"Unknown engine {engine!r}. Available: {', '.join(ENGINES)}")
+    if engine not in spec.supported_engines():
+        raise ValueError(
+            f"Engine {engine!r} cannot serve {key!r} (backend {spec.backend!r}); "
+            f"supported: {', '.join(spec.supported_engines())}"
+        )
+
     if spec.backend == "chat":
+        if engine == "vllm":
+            from translation_benchmark.models.vllm_engine import VLLMChatTranslator
+
+            return VLLMChatTranslator(spec, device=device, **kwargs)
         from translation_benchmark.models.chat import ChatTranslator
 
         return ChatTranslator(spec, device=device, **kwargs)
     if spec.backend == "seq2seq-madlad":
+        if engine == "ct2":
+            from translation_benchmark.models.seq2seq import MadladCT2Translator
+
+            return MadladCT2Translator(spec, device=device, **kwargs)
         from translation_benchmark.models.seq2seq import MadladTranslator
 
         return MadladTranslator(spec, device=device, **kwargs)
     if spec.backend == "seq2seq-nllb":
-        if kwargs.pop("use_ct2", False):
+        if engine == "ct2":
             from translation_benchmark.models.seq2seq import NLLBCT2Translator
 
             return NLLBCT2Translator(spec, device=device, **kwargs)
