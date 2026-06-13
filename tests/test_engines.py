@@ -16,9 +16,24 @@ def test_optimized_engines_are_the_defaults():
     # Chat models default to vLLM, Tier 4 to CTranslate2 — construction must
     # not import the heavy stacks; only load() does.
     assert isinstance(create_translator("tower-plus-9b"), VLLMChatTranslator)
+    assert isinstance(create_translator("qwen3-32b"), VLLMChatTranslator)
     assert isinstance(create_translator("translategemma-27b"), VLLMChatTranslator)
     assert isinstance(create_translator("madlad400-10b"), MadladCT2Translator)
     assert isinstance(create_translator("nllb200-3.3b"), NLLBCT2Translator)
+
+
+def test_translategemma_serves_on_vllm_via_completions_path():
+    # vLLM's chat endpoint strips TranslateGemma's required custom content
+    # fields, so its requests go through client-side template rendering +
+    # /v1/completions; the other families use the server-side chat endpoint.
+    for key in ("translategemma-27b", "translategemma-12b", "translategemma-4b"):
+        assert get_spec(key).engines == ("vllm", "transformers")
+    assert create_translator("translategemma-4b")._style() == "translategemma"
+    assert create_translator("tower-plus-9b")._style() == "tower"
+    # The override flag switches the request path too.
+    assert create_translator("tower-plus-9b", prompt_style="translategemma")._style() == (
+        "translategemma"
+    )
 
 
 def test_transformers_fallback_is_selectable():

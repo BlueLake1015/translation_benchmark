@@ -24,11 +24,14 @@ models = [
     "accelerate>=0.30",
     "sentencepiece>=0.2",
     "protobuf>=4.0",
+    # Lets transformers load AWQ/GPTQ pre-quantized repos (e.g. qwen3-*@awq).
+    "gptqmodel>=2.0",
 ]
 # CPU-efficient NLLB-200 backend.
 ct2 = ["ctranslate2>=4.0"]
-# Optimized serving for the chat models (GPU required).
-vllm = ["vllm>=0.8"]
+# Optimized serving for the chat models (GPU required); the engine talks to
+# a spawned `vllm serve` process via the OpenAI-compatible API.
+vllm = ["vllm>=0.8", "openai>=1.0"]
 # Neural quality metric (slow, needs torch).
 comet = ["unbabel-comet>=2.2"]
 dev = ["pytest>=8.0"]

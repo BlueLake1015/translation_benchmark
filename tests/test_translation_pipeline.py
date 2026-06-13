@@ -61,15 +61,24 @@ def test_translated_srt_output(tmp_path, en_lines):
     ]
 
 
-def test_translategemma_prompt_is_minimal_specialist_format():
-    # Specialist: no system prompt, canonical translation format, context block.
+def test_translategemma_prompt_uses_required_structured_format():
+    # TranslateGemma's chat template rejects plain text: each user turn is a
+    # single structured item with language codes; context is dialogue turns.
     context = [ContextPair("You're late, detective.", "늦었군, 형사.")]
     messages = build_messages(get_spec("translategemma-4b"), "Traffic.", "en", "ko", context)
-    assert [m["role"] for m in messages] == ["user"]
-    content = messages[0]["content"]
-    assert "English: You're late, detective." in content
-    assert "Korean: 늦었군, 형사." in content
-    assert content.endswith("Translate from English to Korean:\nTraffic.")
+    assert [m["role"] for m in messages] == ["user", "assistant", "user"]
+    assert messages[0]["content"] == [
+        {
+            "type": "text",
+            "source_lang_code": "en",
+            "target_lang_code": "ko",
+            "text": "You're late, detective.",
+        }
+    ]
+    assert messages[1]["content"] == "늦었군, 형사."
+    assert messages[2]["content"][0]["text"] == "Traffic."
+    # No instructions anywhere — the format itself carries the task.
+    assert len(messages[2]["content"]) == 1
 
 
 def test_tower_prompt_uses_tuned_format():
@@ -92,6 +101,7 @@ def test_prompt_style_override_for_ab_testing():
     default = build_messages(spec, "Traffic.", "en", "ko", None)
     overridden = build_messages(spec, "Traffic.", "en", "ko", None, prompt_style="qwen")
     assert [m["role"] for m in default] == ["user"]
+    assert isinstance(default[0]["content"], list)  # structured format
     assert [m["role"] for m in overridden] == ["system", "user"]
     # The override threads through the translator construction too.
     translator = ChatTranslator(spec, prompt_style="tower")

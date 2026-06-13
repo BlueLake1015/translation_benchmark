@@ -29,6 +29,9 @@ MODELS: dict[str, ModelSpec] = {
             params_b=27,
             backend="chat",
             prompt_style="translategemma",
+            # vLLM serves it via client-side template rendering and
+            # /v1/completions — its chat endpoint strips the template's
+            # required custom content fields (as of vLLM 0.22).
             engines=("vllm", "transformers"),
             supports_context=True,
             approx_context_tokens=128_000,
@@ -67,6 +70,9 @@ MODELS: dict[str, ModelSpec] = {
             params_b=12,
             backend="chat",
             prompt_style="translategemma",
+            # vLLM serves it via client-side template rendering and
+            # /v1/completions — its chat endpoint strips the template's
+            # required custom content fields (as of vLLM 0.22).
             engines=("vllm", "transformers"),
             supports_context=True,
             approx_context_tokens=128_000,
@@ -120,6 +126,9 @@ MODELS: dict[str, ModelSpec] = {
             params_b=4,
             backend="chat",
             prompt_style="translategemma",
+            # vLLM serves it via client-side template rendering and
+            # /v1/completions — its chat endpoint strips the template's
+            # required custom content fields (as of vLLM 0.22).
             engines=("vllm", "transformers"),
             supports_context=True,
             approx_context_tokens=128_000,

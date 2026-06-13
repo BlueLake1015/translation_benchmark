@@ -1,50 +1,64 @@
 #!/usr/bin/env bash
-# Download every package needed for an offline install into offline/.
+# Download everything needed to rebuild the CURRENT venv offline, into offline/.
 #
 # Usage:
-#   scripts/download_offline.sh [extras]
+#   scripts/download_offline.sh
 #
-#   extras  comma-separated project extras [default: dev,models,ct2,vllm]
-#           e.g. "dev" for a CPU-only test setup, add "comet" for the
-#           neural metric. Heads-up: the default includes torch + vLLM
-#           (CUDA wheels), ~10 GB of downloads.
+#   Reproduces the exact package set of an existing venv (default: ./.venv,
+#   override with $VENV) by freezing it and downloading every pinned
+#   dependency — including packages installed beyond the declared extras
+#   (e.g. gptqmodel, ninja). This guarantees the offline target can rebuild
+#   the same environment, not just the pyproject extras.
 #
-# The offline/ directory will contain:
-#   - pip/setuptools/wheel (to bootstrap the venv offline)
+# offline/ ends up with:
+#   - requirements.lock        the frozen closure (exact versions)
+#   - pip/setuptools/wheel/hatchling  (venv bootstrap + build backend)
 #   - the project wheel itself
-#   - all dependency wheels for the selected extras
+#   - every dependency wheel/sdist at the pinned version
 #
 # Wheels are fetched for THIS machine's platform and Python (linux x86_64,
 # CPython 3.11) — the offline target must match.
 #
-# Install later with: scripts/install_offline.sh <venv_dir> [extras]
+# Rebuild later with: scripts/install_offline.sh <venv_dir>
 set -euo pipefail
 
-EXTRAS="${1:-dev,models,ct2,vllm}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/offline"
-PY="${PYTHON:-python3.11}"
+VENV="${VENV:-$ROOT/.venv}"
+VPY="$VENV/bin/python"
 
-# Some distro pythons (e.g. deadsnakes) ship without pip — bootstrap it.
-if ! "$PY" -m pip --version >/dev/null 2>&1; then
-    echo "pip missing for $PY — bootstrapping via ensurepip"
-    "$PY" -m ensurepip --upgrade --user 2>/dev/null || "$PY" -m ensurepip --upgrade
+if [ ! -x "$VPY" ]; then
+    echo "error: no venv at $VENV — create and populate it first, or set \$VENV" >&2
+    exit 1
 fi
 
 mkdir -p "$DEST"
-echo "Downloading into $DEST (extras: $EXTRAS)"
+LOCK="$DEST/requirements.lock"
 
+echo "Freezing $VENV -> $LOCK"
+# Exact closure, minus the editable project itself (shipped as a wheel below).
+"$VPY" -m pip freeze --exclude-editable \
+    | grep -viE '^(translation-benchmark|-e )' > "$LOCK"
+echo "  $(wc -l < "$LOCK") pinned packages"
+
+echo "Downloading into $DEST ..."
 # Bootstrap tooling for the offline venv + the project's build backend.
-"$PY" -m pip download --dest "$DEST" --quiet pip setuptools wheel hatchling
+"$VPY" -m pip download --dest "$DEST" --quiet pip setuptools wheel hatchling
 
 # The project itself as a wheel, so the offline machine needs no source tree.
-"$PY" -m pip wheel --no-deps --wheel-dir "$DEST" --quiet "$ROOT"
+"$VPY" -m pip wheel --no-deps --wheel-dir "$DEST" --quiet "$ROOT"
 
-# All dependencies for the selected extras.
-"$PY" -m pip download --dest "$DEST" "$ROOT[$EXTRAS]"
+# Every pinned dependency, AS WHEELS. pip wheel downloads a wheel where one
+# exists and BUILDS one from sdist otherwise (e.g. pypcre, gptqmodel) using
+# this machine's network for build deps — so the offline target installs
+# only prebuilt wheels and never needs a compiler/cmake. --no-deps installs
+# exactly the pinned closure without re-resolving (the live venv may carry
+# benign metadata conflicts, e.g. protobuf vs opentelemetry, that a fresh
+# resolve would reject).
+"$VPY" -m pip wheel --wheel-dir "$DEST" --no-deps -r "$LOCK"
 
-COUNT=$(ls "$DEST" | wc -l)
+COUNT=$(find "$DEST" -maxdepth 1 -type f | wc -l)
 SIZE=$(du -sh "$DEST" | cut -f1)
 echo
 echo "Done: $COUNT files, $SIZE in $DEST"
-echo "Install offline with: scripts/install_offline.sh .venv $EXTRAS"
+echo "Rebuild offline with: scripts/install_offline.sh .venv"

@@ -4,10 +4,11 @@ Each model family gets a DEDICATED prompt matching its training
 distribution — off-format prompts measurably degrade specialists and are
 themselves a hallucination trigger:
 
-- ``translategemma``: minimal canonical translation format, no system
-  prompt. A translation specialist drifts when wrapped in
-  meta-instructions, and Gemma chat templates fold system text into the
-  user turn anyway.
+- ``translategemma``: the model's REQUIRED structured format — its chat
+  template rejects plain text. Each user turn is a single content item
+  ``{type: "text", source_lang_code, target_lang_code, text}`` with no
+  instructions at all; document context is provided as real previous
+  user/assistant dialogue turns.
 - ``tower``: the exact pattern Tower/TowerInstruct were tuned on, no
   system prompt — these models were not trained to follow meta-instructions.
 - ``qwen``: detailed system prompt + instruction. Generalists are where
@@ -51,34 +52,49 @@ def _context_block(
     return lines
 
 
-def _messages_translategemma(text, src_name, tgt_name, context) -> list[dict]:
+def _messages_translategemma(text, src, tgt, context) -> list[dict]:
+    """TranslateGemma's chat template enforces this exact structure: user
+    content is an iterable with exactly one mapping carrying the language
+    codes. Context goes in as genuine previous dialogue turns."""
+
+    def _item(value: str) -> list[dict]:
+        return [
+            {
+                "type": "text",
+                "source_lang_code": src.code,
+                "target_lang_code": tgt.code,
+                "text": value,
+            }
+        ]
+
+    messages: list[dict] = []
+    if context:
+        for pair in context:
+            messages.append({"role": "user", "content": _item(pair.source)})
+            messages.append({"role": "assistant", "content": pair.target})
+    messages.append({"role": "user", "content": _item(text)})
+    return messages
+
+
+def _messages_tower(text, src, tgt, context) -> list[dict]:
     parts: list[str] = []
     if context:
-        parts.extend(_context_block(src_name, tgt_name, context))
-    parts.append(f"Translate from {src_name} to {tgt_name}:")
-    parts.append(text)
+        parts.extend(_context_block(src.name, tgt.name, context))
+    parts.append(f"Translate the following text from {src.name} into {tgt.name}.")
+    parts.append(f"{src.name}: {text}")
+    parts.append(f"{tgt.name}:")
     return [{"role": "user", "content": "\n".join(parts)}]
 
 
-def _messages_tower(text, src_name, tgt_name, context) -> list[dict]:
+def _messages_qwen(text, src, tgt, context) -> list[dict]:
     parts: list[str] = []
     if context:
-        parts.extend(_context_block(src_name, tgt_name, context))
-    parts.append(f"Translate the following text from {src_name} into {tgt_name}.")
-    parts.append(f"{src_name}: {text}")
-    parts.append(f"{tgt_name}:")
-    return [{"role": "user", "content": "\n".join(parts)}]
-
-
-def _messages_qwen(text, src_name, tgt_name, context) -> list[dict]:
-    parts: list[str] = []
-    if context:
-        parts.extend(_context_block(src_name, tgt_name, context))
+        parts.extend(_context_block(src.name, tgt.name, context))
     parts.append(
-        f"Translate the next subtitle line from {src_name} to {tgt_name}. "
+        f"Translate the next subtitle line from {src.name} to {tgt.name}. "
         "Output only the translation."
     )
-    parts.append(f"{src_name}: {text}")
+    parts.append(f"{src.name}: {text}")
     return [
         {"role": "system", "content": SYSTEM_PROMPT},
         {"role": "user", "content": "\n".join(parts)},
@@ -111,9 +127,7 @@ def build_messages(
         raise ValueError(
             f"Unknown prompt style {style!r}; available: {', '.join(sorted(PROMPT_STYLES))}"
         ) from None
-    src_name = get_language(src_lang).name
-    tgt_name = get_language(tgt_lang).name
-    return builder(text, src_name, tgt_name, context)
+    return builder(text, get_language(src_lang), get_language(tgt_lang), context)
 
 
 class ChatTranslator(BaseTranslator):
@@ -161,7 +175,15 @@ class ChatTranslator(BaseTranslator):
             self.hf_override or plan.hf_id, plan.dir_key, self.models_dir
         )
         self._tokenizer = AutoTokenizer.from_pretrained(source, **extra)
-        self._model = AutoModelForCausalLM.from_pretrained(source, **kwargs, **extra)
+        try:
+            self._model = AutoModelForCausalLM.from_pretrained(source, **kwargs, **extra)
+        except ValueError:
+            # TranslateGemma ships as a Gemma3 image-text-to-text checkpoint.
+            from transformers import AutoModelForImageTextToText
+
+            self._model = AutoModelForImageTextToText.from_pretrained(
+                source, **kwargs, **extra
+            )
         self._model.eval()
 
     def unload(self) -> None:  # pragma: no cover
@@ -202,17 +224,18 @@ class ChatTranslator(BaseTranslator):
                 # subtitle translation wants the direct answer.
                 template_kwargs["enable_thinking"] = False
             inputs = self._tokenizer.apply_chat_template(
-                messages, tokenize=True, return_tensors="pt", **template_kwargs
+                messages, tokenize=True, return_dict=True, return_tensors="pt",
+                **template_kwargs,
             ).to(self._model.device)
             with torch.no_grad():
                 output = self._model.generate(
-                    inputs,
+                    **inputs,
                     # Cap relative to the source line so repetition loops are
                     # cut early instead of running to the global limit.
                     max_new_tokens=guards.max_new_tokens_for(text, self.max_new_tokens),
                     do_sample=False,
                     pad_token_id=self._tokenizer.eos_token_id,
                 )
-            new_tokens = output[0][inputs.shape[-1] :]
+            new_tokens = output[0][inputs["input_ids"].shape[-1] :]
             results.append(self._tokenizer.decode(new_tokens, skip_special_tokens=True).strip())
         return results

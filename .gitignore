@@ -10,3 +10,4 @@ results/
 models/*
 !models/.gitkeep
 offline/
+tests/test_result/

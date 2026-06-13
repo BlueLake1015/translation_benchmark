@@ -12,6 +12,85 @@ is **English → Korean**, but any language pair supported by the models works.
 - Speed (segments/s, chars/s) + quality (chrF++, BLEU, optional COMET) reports
   in JSON and Markdown
 
+## Install
+
+Requires Python 3.11.
+
+```bash
+python3.11 -m venv .venv && source .venv/bin/activate
+pip install -e .              # core: srt parsing, metrics, CLI
+pip install -e '.[models]'    # + torch/transformers (real model inference)
+pip install -e '.[vllm]'      # + vLLM (optimized serving, chat models, GPU)
+pip install -e '.[ct2]'       # + CTranslate2 (CPU NLLB backend)
+pip install -e '.[comet]'     # + COMET neural metric
+pip install -e '.[dev]'       # + pytest
+```
+
+### Offline install
+
+For air-gapped machines, two scripts handle the package side (model weights
+are covered by the `models/` directory above):
+
+```bash
+# On a connected machine: download all wheels into offline/
+scripts/download_offline.sh                # full stack: dev,models,ct2,vllm (~10 GB)
+scripts/download_offline.sh dev            # CPU-only test profile (~35 MB)
+
+# On the target machine (same OS/arch/Python 3.11): venv + install, no network
+scripts/install_offline.sh .venv           # extras must match the download
+scripts/install_offline.sh .venv dev
+```
+
+`offline/` ends up with pip/setuptools/wheel (venv bootstrap), the project
+wheel itself, and every dependency wheel — `install_offline.sh` uses
+`--no-index --find-links offline/` only. Wheels are platform-specific:
+download on a machine matching the offline target (linux x86_64, CPython
+3.11).
+
+## Testing
+
+The test suite targets **English → Korean** and runs anywhere — no GPU, no
+model downloads. It exercises the full pipeline (`.srt` parsing → context
+threading → translation → `.srt` writing → benchmark reports) against a
+real-world-style film subtitle fixture
+([night_shift.en.srt](tests/data/night_shift.en.srt) with a Korean reference
+[night_shift.ko.srt](tests/data/night_shift.ko.srt)) using a deterministic
+dummy backend; real model backends are construction-tested without loading
+weights.
+
+```bash
+pip install -e '.[dev]'
+pytest
+```
+
+### ⚡ Real model translation runs (outside pytest)
+
+Real-model runs are deliberately **not part of the test suite** — they live
+in the standalone [scripts/run_models.py](scripts/run_models.py):
+
+```bash
+python scripts/run_models.py                          # every model, every engine
+python scripts/run_models.py tower-plus-9b --input movie.en.srt --output-dir /tmp/out
+python scripts/run_models.py --engine transformers    # one engine only
+python scripts/run_models.py qwen3-32b --quant awq
+```
+
+It sweeps every selected model across **all of its supported engines**
+(falling back to a downloaded quant variant like `qwen3-32b@awq` if only
+that is present) and prints a per-(model, engine) result summary —
+**SUCCESS** (cues, speed, guard flags), **SKIP** (weights or engine extra
+missing — never an error), or **FAIL** (with the reason). Each output is
+named **`tests/test_result/<model-key>.<engine>.<input-stem>.<tgt>.srt`**,
+so a model's vLLM and transformers results sit side by side for review.
+
+Each (model, engine) runs in **its own subprocess** so GPU memory is fully
+reclaimed between runs — some in-process loads (e.g. AWQ via gptqmodel)
+don't release on unload, which would otherwise starve the next vLLM server.
+Logs still stream live; `--no-isolate` runs everything in one process.
+
+Stage weights first with `scripts/download_models.py`
+(+ `scripts/convert_ct2.py` for Tier 4).
+
 ## Supported models
 
 ### Tier 1 — Frontier open-weight (server-class hardware)
@@ -123,6 +202,33 @@ Every `tb translate` / `tb benchmark` run accepts `--quant`:
 variant fails fast with the available list. An explicit `--hf-id` overrides
 the variant repo. NLLB's CTranslate2 int8 path is separate (`--ct2-dir`).
 
+Loading an `awq`/`gptq` repo on the **transformers** engine needs
+`gptqmodel` (bundled in the `.[models]` extra); the **vllm** engine has
+native AWQ/FP8 kernels and needs nothing extra.
+
+## Inference engines
+
+Every model is served by its **optimized engine by default**; plain
+transformers is the explicit fallback (`--engine transformers`):
+
+| Models | Default engine | Fallback | Notes |
+|---|---|---|---|
+| Chat models (Tiers 1–3) | `vllm` | `transformers` | Spawns a `vllm serve` process on the local model dir and talks the OpenAI-compatible API; the server is terminated on unload and at exit. Supports `--quant 4bit/awq/fp8` (not `8bit`). Qwen/Tower use the chat endpoint (server-side templates); TranslateGemma's template needs custom content fields that vLLM's chat endpoint strips (≤0.22), so its requests render the checkpoint template client-side and go to `/v1/completions` |
+| MADLAD-400, NLLB-200 (Tier 4) | `ct2` (CTranslate2) | `transformers` | int8, CPU-viable; needs a one-time `ct2-transformers-converter` conversion into `models/<key>-ct2` (a clear error tells you the exact command if missing) |
+
+`tb list-models` shows the engines per model. Both chat engines share the
+same prompts and rolling-context handling, so quality comparisons across
+engines are apples-to-apples. Note that context-aware document translation
+is sequential by nature (each line's context includes the previous
+translation), so vLLM's batching shines most with `--context-window 0` or on
+long files; otherwise the win is faster prefill/decode.
+
+```bash
+tb benchmark movie.en.srt -m qwen3-32b --quant awq -r movie.ko.srt   # vLLM by default
+tb translate movie.en.srt -m madlad400-10b                            # CTranslate2 by default
+tb translate movie.en.srt -m tower-plus-9b --engine transformers      # explicit fallback
+```
+
 ## Hallucination mitigation
 
 LLM translators hallucinate in characteristic ways — runaway repetition
@@ -188,64 +294,6 @@ The tuned style is registry data (`prompt_style`); override it per run with
 guards are model-agnostic, so flag counts stay comparable across styles.
 Tier 4 models bypass all of this and receive bare sentences in batches.
 
-## Install
-
-Requires Python 3.11.
-
-```bash
-python3.11 -m venv .venv && source .venv/bin/activate
-pip install -e .              # core: srt parsing, metrics, CLI
-pip install -e '.[models]'    # + torch/transformers (real model inference)
-pip install -e '.[vllm]'      # + vLLM (optimized serving, chat models, GPU)
-pip install -e '.[ct2]'       # + CTranslate2 (CPU NLLB backend)
-pip install -e '.[comet]'     # + COMET neural metric
-pip install -e '.[dev]'       # + pytest
-```
-
-### Offline install
-
-For air-gapped machines, two scripts handle the package side (model weights
-are covered by the `models/` directory above):
-
-```bash
-# On a connected machine: download all wheels into offline/
-scripts/download_offline.sh                # full stack: dev,models,ct2,vllm (~10 GB)
-scripts/download_offline.sh dev            # CPU-only test profile (~35 MB)
-
-# On the target machine (same OS/arch/Python 3.11): venv + install, no network
-scripts/install_offline.sh .venv           # extras must match the download
-scripts/install_offline.sh .venv dev
-```
-
-`offline/` ends up with pip/setuptools/wheel (venv bootstrap), the project
-wheel itself, and every dependency wheel — `install_offline.sh` uses
-`--no-index --find-links offline/` only. Wheels are platform-specific:
-download on a machine matching the offline target (linux x86_64, CPython
-3.11).
-
-## Inference engines
-
-Every model is served by its **optimized engine by default**; plain
-transformers is the explicit fallback (`--engine transformers`):
-
-| Models | Default engine | Fallback | Notes |
-|---|---|---|---|
-| Chat (Tiers 1–3) | `vllm` | `transformers` | Paged attention, continuous batching, native AWQ/FP8 kernels; GPU only. Supports `--quant 4bit/awq/fp8` (not `8bit`) |
-| MADLAD-400, NLLB-200 (Tier 4) | `ct2` (CTranslate2) | `transformers` | int8, CPU-viable; needs a one-time `ct2-transformers-converter` conversion into `models/<key>-ct2` (a clear error tells you the exact command if missing) |
-
-`tb list-models` shows the engines per model. Both chat engines share the
-same prompts and rolling-context handling, so quality comparisons across
-engines are apples-to-apples. Note that context-aware document translation
-is sequential by nature (each line's context includes the previous
-translation), so vLLM's batching shines most with `--context-window 0` or on
-long files; otherwise the win is faster prefill/decode.
-
-```bash
-tb benchmark movie.en.srt -m qwen3-32b --quant awq -r movie.ko.srt   # vLLM by default
-tb translate movie.en.srt -m madlad400-10b                            # CTranslate2 by default
-tb translate movie.en.srt -m tower-plus-9b --engine transformers      # explicit fallback
-```
-
 ## Usage
 
 ```bash
@@ -284,22 +332,6 @@ leaderboard:
 Timing measures translation throughput only — model load/download happens
 before the clock starts. chrF++ is the primary quality metric (tokenizer-free,
 appropriate for Korean); BLEU uses character tokenization for ko/ja/zh.
-
-## Testing
-
-The test suite targets **English → Korean** and runs anywhere — no GPU, no
-model downloads. It exercises the full pipeline (`.srt` parsing → context
-threading → translation → `.srt` writing → benchmark reports) against a
-real-world-style film subtitle fixture
-([night_shift.en.srt](tests/data/night_shift.en.srt) with a Korean reference
-[night_shift.ko.srt](tests/data/night_shift.ko.srt)) using a deterministic
-dummy backend; real model backends are construction-tested without loading
-weights.
-
-```bash
-pip install -e '.[dev]'
-pytest
-```
 
 ## Project layout
 
